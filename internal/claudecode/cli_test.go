@@ -112,18 +112,23 @@ func TestBuildCommandWithAgents(t *testing.T) {
 
 func TestBuildCommandWithExtraArgs(t *testing.T) {
 	val := "/tmp/mcp.json"
+	profileVal := "my-profile"
 	o := &Options{
 		ExtraArgs: map[string]*string{
 			"mcp-config": &val,
-			"no-color":   nil,
+			"profile":    &profileVal,
+			"notify":     nil,
 		},
 	}
 	cmd := buildCommand("claude", o, false)
 	if !containsPair(cmd, "--mcp-config", "/tmp/mcp.json") {
 		t.Fatal("expected --mcp-config")
 	}
-	if !contains(cmd, "--no-color") {
-		t.Fatal("expected --no-color")
+	if !containsPair(cmd, "--profile", "my-profile") {
+		t.Fatal("expected --profile")
+	}
+	if !contains(cmd, "--notify") {
+		t.Fatal("expected --notify")
 	}
 }
 
@@ -234,23 +239,26 @@ func isConnectionError(err error, target **ConnectionError) bool {
 	return errors.As(err, target)
 }
 
-func TestBuildCommandDisallowedExtraArgs(t *testing.T) {
+func TestBuildCommandRejectsUnknownExtraArgs(t *testing.T) {
 	pm := "bypassPermissions"
 	o := &Options{
 		ExtraArgs: map[string]*string{
 			"permission-mode": &pm,
 			"no-color":        nil,
+			"notify":          nil,
 		},
 	}
 	cmd := buildCommand("claude", o, false)
-	// Disallowed flags should be filtered out — permission-mode from ExtraArgs
-	// should not override the one set via Options.PermissionMode.
+	// Non-allowlisted flags should be filtered out.
 	if containsPair(cmd, "--permission-mode", "bypassPermissions") {
 		t.Fatal("permission-mode should be filtered from ExtraArgs")
 	}
-	// Allowed flags should remain.
-	if !contains(cmd, "--no-color") {
-		t.Fatal("expected --no-color to be allowed")
+	if contains(cmd, "--no-color") {
+		t.Fatal("no-color should be filtered from ExtraArgs")
+	}
+	// Allowlisted flags should remain.
+	if !contains(cmd, "--notify") {
+		t.Fatal("expected --notify to be allowed")
 	}
 }
 

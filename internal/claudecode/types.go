@@ -1,5 +1,10 @@
 package claudecode
 
+import (
+	"fmt"
+	"strings"
+)
+
 // Message type constants.
 const (
 	MessageTypeUser            = "user"
@@ -151,6 +156,18 @@ type McpStdioServerConfig struct {
 }
 
 func (c *McpStdioServerConfig) GetType() McpServerType { return McpServerTypeStdio }
+
+// Validate checks that the MCP server config has a non-empty command and that
+// the command path contains no path traversal sequences.
+func (c *McpStdioServerConfig) Validate() error {
+	if c.Command == "" {
+		return fmt.Errorf("MCP server command must not be empty")
+	}
+	if strings.Contains(c.Command, "..") {
+		return fmt.Errorf("MCP server command must not contain path traversal sequences")
+	}
+	return nil
+}
 
 // AgentModel represents the model to use for an agent.
 type AgentModel string

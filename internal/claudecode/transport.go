@@ -28,6 +28,7 @@ type transport struct {
 
 	connected bool
 	mu        sync.RWMutex
+	writeMu   sync.Mutex // serializes writes to stdin
 
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
@@ -153,7 +154,10 @@ func (t *transport) sendMessage(ctx context.Context, message StreamMessage) erro
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
+	// Serialize writes to prevent interleaved output from concurrent senders.
+	t.writeMu.Lock()
 	_, err = t.stdin.Write(append(data, '\n'))
+	t.writeMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to write message: %w", err)
 	}
@@ -343,6 +347,11 @@ func (t *transport) prepareMcpConfig() (*Options, error) {
 
 	serversForCLI := make(map[string]any)
 	for name, config := range t.options.McpServers {
+		if stdio, ok := config.(*McpStdioServerConfig); ok {
+			if err := stdio.Validate(); err != nil {
+				return nil, fmt.Errorf("invalid MCP server %q: %w", name, err)
+			}
+		}
 		serversForCLI[name] = config
 	}
 

@@ -66,14 +66,19 @@ func findCLI() (string, error) {
 			"Or specify the path when creating client")
 }
 
-// disallowedExtraArgs is the set of CLI flags that must not be overridden
-// via ExtraArgs, as they could bypass security controls or break the protocol.
-var disallowedExtraArgs = map[string]bool{
-	"permission-mode": true,
-	"output-format":   true,
-	"input-format":    true,
-	"verbose":         true,
-	"print":           true,
+// allowedExtraArgs is the set of CLI flags that may be passed via ExtraArgs.
+// Only explicitly allowed flags are forwarded to prevent callers from
+// accidentally overriding security-sensitive flags (e.g. permission-mode,
+// output-format) or breaking the streaming protocol.
+var allowedExtraArgs = map[string]bool{
+	"mcp-config":       true,
+	"max-thinking":     true,
+	"budget-tokens":    true,
+	"notify":           true,
+	"no-user-prompts":  true,
+	"prefill":          true,
+	"profile":          true,
+	"project-dir":      true,
 }
 
 // buildCommand constructs the CLI command with all necessary flags.
@@ -148,9 +153,9 @@ func buildCommand(cliPath string, options *Options, closeStdin bool) []string {
 	cmd = append(cmd, "--setting-sources", sourcesValue)
 
 	// Extra args (includes --mcp-config when MCP servers are configured).
-	// Validate that no security-sensitive flags are being overridden.
+	// Only explicitly allowed flags are forwarded to the CLI.
 	for flag, value := range options.ExtraArgs {
-		if disallowedExtraArgs[flag] {
+		if !allowedExtraArgs[flag] {
 			continue
 		}
 		if value == nil {

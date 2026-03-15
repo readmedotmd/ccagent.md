@@ -2,23 +2,48 @@ package ai_adapters
 
 import "time"
 
+// ToolStatusValue represents the lifecycle state of a tool call.
+type ToolStatusValue string
+
+const (
+	ToolRunning  ToolStatusValue = "running"
+	ToolComplete ToolStatusValue = "complete"
+	ToolFailed   ToolStatusValue = "failed"
+)
+
+// SubAgentStatus represents the lifecycle state of a sub-agent.
+type SubAgentStatus string
+
+const (
+	SubAgentStarted   SubAgentStatus = "started"
+	SubAgentCompleted SubAgentStatus = "completed"
+	SubAgentFailed    SubAgentStatus = "failed"
+)
+
 // StreamEventType categorizes streaming events.
 type StreamEventType int
 
 const (
-	EventToken             StreamEventType = iota
+	EventToken StreamEventType = iota
 	EventDone
 	EventError
 	EventToolUse
 	EventToolResult
 	EventSystem
 	EventThinking
-	EventPermissionRequest // agent requests approval to run a tool
-	EventPermissionResult  // result of a permission decision (for logging/replay)
-	EventProgress          // progress update for a long-running tool call
-	EventFileChange        // agent created, edited, or deleted a file
-	EventSubAgent          // agent delegated to a sub-agent
-	EventCostUpdate        // token usage / cost update
+	EventPermissionRequest
+	EventPermissionResult
+	EventProgress
+	EventFileChange
+	EventSubAgent
+	EventCostUpdate
+	EventCompactionBegin
+	EventCompactionEnd
+	EventStepBegin
+	EventStepEnd
+	EventToolInputStream
+	EventExternalToolCall
+	EventDisplayBlock
 )
 
 // TokenUsage reports token consumption and cost for a turn or session.
@@ -27,7 +52,7 @@ type TokenUsage struct {
 	OutputTokens int
 	CacheRead    int
 	CacheWrite   int
-	TotalCost    float64 // estimated cost in USD
+	TotalCost    float64
 }
 
 // FileChangeOp describes what happened to a file.
@@ -44,7 +69,7 @@ const (
 type FileChange struct {
 	Op      FileChangeOp
 	Path    string
-	OldPath string // for renames
+	OldPath string
 }
 
 // PermissionRequest is sent when the agent needs user approval.
@@ -52,16 +77,69 @@ type PermissionRequest struct {
 	ToolCallID  string
 	ToolName    string
 	ToolInput   any
-	Description string // human-readable summary of what the tool will do
+	Description string
 }
 
 // SubAgentEvent describes sub-agent lifecycle events.
 type SubAgentEvent struct {
 	AgentID   string
 	AgentName string
-	Status    string // "started", "completed", "failed"
+	Status    SubAgentStatus
 	Prompt    string
 	Result    string
+}
+
+// CompactionInfo provides details about context compaction.
+type CompactionInfo struct {
+	Reason       string
+	TokensBefore int
+	TokensAfter  int
+	Summary      string
+}
+
+// StepInfo provides details about step lifecycle.
+type StepInfo struct {
+	StepNumber int
+	TotalSteps int
+}
+
+// DisplayBlockType identifies the type of rich display content.
+type DisplayBlockType string
+
+const (
+	DisplayBlockBrief   DisplayBlockType = "brief"
+	DisplayBlockDiff    DisplayBlockType = "diff"
+	DisplayBlockTodo    DisplayBlockType = "todo"
+	DisplayBlockShell   DisplayBlockType = "shell"
+	DisplayBlockUnknown DisplayBlockType = "unknown"
+)
+
+// TodoStatus represents the status of a todo item.
+type TodoStatus string
+
+const (
+	TodoStatusPending    TodoStatus = "pending"
+	TodoStatusInProgress TodoStatus = "in_progress"
+	TodoStatusDone       TodoStatus = "done"
+)
+
+// TodoItem represents a single todo item.
+type TodoItem struct {
+	Title  string
+	Status TodoStatus
+}
+
+// DisplayBlock represents rich output content from tools.
+type DisplayBlock struct {
+	Type     DisplayBlockType
+	Text     string
+	Path     string
+	OldText  string
+	NewText  string
+	Items    []TodoItem
+	Language string
+	Command  string
+	Data     map[string]any
 }
 
 // StreamEvent represents a single event in the streaming response.
@@ -69,34 +147,28 @@ type StreamEvent struct {
 	Type      StreamEventType
 	Timestamp time.Time
 
-	// Content
 	Token    string
 	Thinking string
 
-	// Tool use — ToolCallID correlates request with result.
 	ToolCallID string
 	ToolName   string
 	ToolInput  any
 	ToolOutput any
-	ToolStatus string // "running", "complete", "failed"
+	ToolStatus ToolStatusValue
 
-	// Permission flow
 	Permission *PermissionRequest
-
-	// File operations
 	FileChange *FileChange
+	SubAgent   *SubAgentEvent
 
-	// Sub-agent delegation
-	SubAgent *SubAgentEvent
-
-	// Progress for long-running operations
-	ProgressPct float64 // 0–1, -1 if indeterminate
+	ProgressPct float64
 	ProgressMsg string
 
-	// Cost / usage
 	Usage *TokenUsage
 
-	// Control flow
+	Compaction *CompactionInfo
+	Step       *StepInfo
+	DisplayBlock *DisplayBlock
+
 	Error   error
 	Message *Message
 }

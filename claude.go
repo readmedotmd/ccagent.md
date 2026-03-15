@@ -29,16 +29,25 @@ var (
 	ErrQueueFull         = errors.New("message queue is full")
 )
 
-// Compile-time checks: Adapter + optional SessionProvider.
+// Compile-time checks: Adapter + optional interfaces.
 var (
-	_ ai.Adapter         = (*ClaudeAdapter)(nil)
-	_ ai.SessionProvider = (*ClaudeAdapter)(nil)
+	_ ai.Adapter            = (*ClaudeAdapter)(nil)
+	_ ai.SessionProvider    = (*ClaudeAdapter)(nil)
+	_ ai.HistoryProvider    = (*ClaudeAdapter)(nil)
+	_ ai.HistoryClearer     = (*ClaudeAdapter)(nil)
+	_ ai.PermissionResponder = (*ClaudeAdapter)(nil)
 )
 
 // trackedMessage records a message exchanged with Claude for token estimation.
 type trackedMessage struct {
 	role    string
 	content string
+}
+
+// permissionDecision records a pending permission decision.
+type permissionDecision struct {
+	toolCallID string
+	response   ai.ApprovalResponse
 }
 
 type ClaudeAdapter struct {
@@ -62,11 +71,18 @@ type ClaudeAdapter struct {
 	history         []trackedMessage
 	estimatedTokens int
 	contextWindow   int
+
+	// Permission handling.
+	permissionCh chan permissionDecision
+	
+	// Status change callbacks.
+	statusCallbacks []func(ai.AdapterStatus)
 }
 
 func NewClaudeAdapter() *ClaudeAdapter {
 	return &ClaudeAdapter{
-		status: ai.StatusIdle,
+		status:       ai.StatusIdle,
+		permissionCh: make(chan permissionDecision, 16),
 	}
 }
 
@@ -158,7 +174,7 @@ func (c *ClaudeAdapter) Start(ctx context.Context, cfg ai.AdapterConfig) error {
 		c.contextWindow = DefaultContextWindow
 	}
 
-	c.status = ai.StatusRunning
+	c.setStatus(ai.StatusRunning)
 	return nil
 }
 
@@ -171,6 +187,14 @@ func (c *ClaudeAdapter) forwardClientErrors(client claudecode.Client) {
 			Error:     fmt.Errorf("transport: %w", err),
 			Timestamp: time.Now(),
 		})
+	}
+}
+
+// setStatus updates the adapter status and notifies listeners.
+func (c *ClaudeAdapter) setStatus(status ai.AdapterStatus) {
+	c.status = status
+	for _, fn := range c.statusCallbacks {
+		fn(status)
 	}
 }
 
@@ -321,8 +345,6 @@ func messageImages(msg ai.Message) (images [][]byte, mediaTypes []string) {
 }
 
 // estimateTokens returns a rough token count for the given text.
-// Uses rune count / 4 as a heuristic; this is imprecise for non-Latin scripts
-// and code but sufficient for triggering compaction at the right order of magnitude.
 func estimateTokens(text string) int {
 	return utf8.RuneCountInString(text) / 4
 }
@@ -352,6 +374,16 @@ func (c *ClaudeAdapter) runClaude(ctx context.Context, msg ai.Message) {
 		sessionID = c.sessionID
 		c.mu.Unlock()
 	}
+
+	// Emit step begin event
+	c.emit(ai.StreamEvent{
+		Type:      ai.EventStepBegin,
+		Timestamp: time.Now(),
+		Step: &ai.StepInfo{
+			StepNumber: 1,
+			TotalSteps: -1,
+		},
+	})
 
 	// Send the query — use QueryStream for multimodal, Query/QueryWithSession for text-only.
 	images, mediaTypes := messageImages(msg)
@@ -444,7 +476,7 @@ func (c *ClaudeAdapter) runClaude(ctx context.Context, msg ai.Message) {
 						ToolCallID: b.ToolUseID,
 						ToolName:   b.Name,
 						ToolInput:  toolInput,
-						ToolStatus: "running",
+						ToolStatus: ai.ToolRunning,
 						Timestamp:  time.Now(),
 					})
 				case *claudecode.ThinkingBlock:
@@ -491,6 +523,16 @@ func (c *ClaudeAdapter) runClaude(ctx context.Context, msg ai.Message) {
 				})
 			}
 
+			// Emit step end event
+			c.emit(ai.StreamEvent{
+				Type:      ai.EventStepEnd,
+				Timestamp: time.Now(),
+				Step: &ai.StepInfo{
+					StepNumber: 1,
+					TotalSteps: 1,
+				},
+			})
+
 			c.emit(ai.StreamEvent{
 				Type:      ai.EventDone,
 				Timestamp: time.Now(),
@@ -508,6 +550,17 @@ func (c *ClaudeAdapter) runClaude(ctx context.Context, msg ai.Message) {
 	// Fallback: if ReceiveMessages closed without a ResultMessage, emit done.
 	content := fullContent.String()
 	log.Printf("claude: ReceiveMessages ended without ResultMessage, content_len=%d", len(content))
+	
+	// Emit step end event
+	c.emit(ai.StreamEvent{
+		Type:      ai.EventStepEnd,
+		Timestamp: time.Now(),
+		Step: &ai.StepInfo{
+			StepNumber: 1,
+			TotalSteps: 1,
+		},
+	})
+	
 	c.emit(ai.StreamEvent{
 		Type:      ai.EventDone,
 		Timestamp: time.Now(),
@@ -526,6 +579,7 @@ func (c *ClaudeAdapter) compactSession(ctx context.Context) {
 	history := make([]trackedMessage, len(c.history))
 	copy(history, c.history)
 	client := c.client
+	tokensBefore := c.estimatedTokens
 	c.mu.Unlock()
 
 	// Build a conversation transcript for summarization.
@@ -538,12 +592,32 @@ func (c *ClaudeAdapter) compactSession(ctx context.Context) {
 		fmt.Fprintf(&transcript, "[%s]: %s\n", m.role, content)
 	}
 
-	log.Printf("claude: compacting session (history=%d messages, est_tokens=%d)", len(history), c.estimatedTokens)
+	log.Printf("claude: compacting session (history=%d messages, est_tokens=%d)", len(history), tokensBefore)
+
+	// Emit compaction begin event
+	c.emit(ai.StreamEvent{
+		Type:      ai.EventCompactionBegin,
+		Timestamp: time.Now(),
+		Compaction: &ai.CompactionInfo{
+			Reason:       "context_limit",
+			TokensBefore: tokensBefore,
+		},
+	})
 
 	summarizePrompt := "Summarize the following conversation concisely, preserving key decisions, file changes made, and current state. Be brief.\n\n" + transcript.String()
 
 	if err := client.Query(ctx, summarizePrompt); err != nil {
 		log.Printf("claude: compaction summary query failed, skipping compaction")
+		c.emit(ai.StreamEvent{
+			Type:      ai.EventCompactionEnd,
+			Timestamp: time.Now(),
+			Compaction: &ai.CompactionInfo{
+				Reason:       "context_limit",
+				TokensBefore: tokensBefore,
+				TokensAfter:  tokensBefore,
+				Summary:      "[compaction failed]",
+			},
+		})
 		return
 	}
 
@@ -572,7 +646,20 @@ summaryLoop:
 	c.sessionID = ""
 	c.history = []trackedMessage{{role: "user", content: summaryStr}}
 	c.estimatedTokens = estimateTokens(summaryStr)
+	tokensAfter := c.estimatedTokens
 	c.mu.Unlock()
+
+	// Emit compaction end event
+	c.emit(ai.StreamEvent{
+		Type:      ai.EventCompactionEnd,
+		Timestamp: time.Now(),
+		Compaction: &ai.CompactionInfo{
+			Reason:       "context_limit",
+			TokensBefore: tokensBefore,
+			TokensAfter:  tokensAfter,
+			Summary:      summaryStr,
+		},
+	})
 
 	// Send the summary as the first message of a new session so Claude has context.
 	contextMsg := "[Previous conversation summary]\n" + summaryStr + "\n\nPlease acknowledge you have this context and continue."
@@ -605,7 +692,7 @@ summaryLoop:
 		}
 	}
 
-	log.Printf("claude: compaction complete, est_tokens=%d", c.estimatedTokens)
+	log.Printf("claude: compaction complete, est_tokens=%d", tokensAfter)
 }
 
 // SessionID implements the optional ai.SessionProvider interface.
@@ -613,6 +700,54 @@ func (c *ClaudeAdapter) SessionID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sessionID
+}
+
+// GetHistory implements the optional ai.HistoryProvider interface.
+func (c *ClaudeAdapter) GetHistory(ctx context.Context) ([]ai.Message, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var msgs []ai.Message
+	for _, tm := range c.history {
+		role := ai.RoleUser
+		if tm.role == "assistant" {
+			role = ai.RoleAssistant
+		}
+		msgs = append(msgs, ai.Message{
+			Role:      role,
+			Content:   ai.TextContent(tm.content),
+			Timestamp: time.Now(),
+		})
+	}
+	return msgs, nil
+}
+
+// ClearHistory implements the optional ai.HistoryClearer interface.
+func (c *ClaudeAdapter) ClearHistory(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.history = nil
+	c.estimatedTokens = 0
+	return nil
+}
+
+// RespondPermission implements the optional ai.PermissionResponder interface.
+// Note: Claude Code CLI doesn't support dynamic permission responses during a turn.
+// This method stores the decision for future reference but cannot affect in-flight requests.
+func (c *ClaudeAdapter) RespondPermission(ctx context.Context, toolCallID string, response ai.ApprovalResponse) error {
+	select {
+	case c.permissionCh <- permissionDecision{toolCallID: toolCallID, response: response}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// OnStatusChange implements the optional ai.StatusListener interface.
+func (c *ClaudeAdapter) OnStatusChange(fn func(ai.AdapterStatus)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.statusCallbacks = append(c.statusCallbacks, fn)
 }
 
 func (c *ClaudeAdapter) Receive() <-chan ai.StreamEvent {
@@ -634,7 +769,7 @@ func (c *ClaudeAdapter) Stop() error {
 	if c.client != nil {
 		c.client.Disconnect()
 	}
-	c.status = ai.StatusStopped
+	c.setStatus(ai.StatusStopped)
 	c.mu.Unlock()
 
 	// Wait for all goroutines to finish before closing the events channel.
@@ -653,15 +788,15 @@ func (c *ClaudeAdapter) Status() ai.AdapterStatus {
 func (c *ClaudeAdapter) Capabilities() ai.AdapterCapabilities {
 	return ai.AdapterCapabilities{
 		SupportsStreaming:    true,
-		SupportsImages:      true,
-		SupportsFiles:       true,
-		SupportsToolUse:     true,
-		SupportsMCP:         true,
-		SupportsThinking:    true,
+		SupportsImages:       true,
+		SupportsFiles:        true,
+		SupportsToolUse:      true,
+		SupportsMCP:          true,
+		SupportsThinking:     true,
 		SupportsCancellation: true,
-		SupportsHistory:     false,
-		SupportsSubAgents:   true,
-		MaxContextWindow:    DefaultContextWindow,
+		SupportsHistory:      true,
+		SupportsSubAgents:    true,
+		MaxContextWindow:     DefaultContextWindow,
 	}
 }
 

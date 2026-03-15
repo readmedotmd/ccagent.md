@@ -264,8 +264,8 @@ func TestCapabilities(t *testing.T) {
 	if !caps.SupportsCancellation {
 		t.Fatal("expected cancellation support")
 	}
-	if caps.SupportsHistory {
-		t.Fatal("expected no history support")
+	if !caps.SupportsHistory {
+		t.Fatal("expected history support")
 	}
 	if !caps.SupportsSubAgents {
 		t.Fatal("expected sub-agent support")

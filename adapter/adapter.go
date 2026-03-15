@@ -1,6 +1,9 @@
 package ai_adapters
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // AdapterStatus represents the current state of an adapter.
 type AdapterStatus int
@@ -19,6 +22,18 @@ const (
 	PermissionDefault   PermissionMode = "default"
 	PermissionAcceptAll PermissionMode = "accept_all"
 	PermissionPlan      PermissionMode = "plan"
+)
+
+// ApprovalResponse represents the possible responses to a permission request.
+type ApprovalResponse string
+
+const (
+	// ApprovalResponseApprove approves the tool call for this instance only.
+	ApprovalResponseApprove ApprovalResponse = "approve"
+	// ApprovalResponseApproveForSession approves this tool for the entire session.
+	ApprovalResponseApproveForSession ApprovalResponse = "approve_for_session"
+	// ApprovalResponseReject rejects the tool call.
+	ApprovalResponseReject ApprovalResponse = "reject"
 )
 
 // MCPServerConfig describes an MCP stdio server to attach to the adapter.
@@ -57,6 +72,9 @@ type AdapterConfig struct {
 	DisallowedTools    []string
 	Agents             map[string]AgentDef
 	ContextWindow      int // context window size in tokens (0 = adapter default)
+
+	// ExternalTools allows registering custom tools that the model can call.
+	ExternalTools []ExternalTool
 }
 
 // SendOptions controls per-turn behaviour for a Send call.
@@ -91,19 +109,20 @@ func WithTools(tools []string) SendOption {
 }
 
 // AdapterCapabilities describes what features an adapter supports.
-// The UI uses this to decide which controls to show.
 type AdapterCapabilities struct {
-	SupportsStreaming    bool
-	SupportsImages      bool
-	SupportsFiles       bool
-	SupportsToolUse     bool
-	SupportsMCP         bool
-	SupportsThinking    bool
-	SupportsCancellation bool
-	SupportsHistory     bool
-	SupportsSubAgents   bool
-	MaxContextWindow    int
-	SupportedModels     []string
+	SupportsStreaming     bool
+	SupportsImages        bool
+	SupportsFiles         bool
+	SupportsToolUse       bool
+	SupportsMCP           bool
+	SupportsThinking      bool
+	SupportsCancellation  bool
+	SupportsHistory       bool
+	SupportsSubAgents     bool
+	SupportsExternalTools bool
+	SupportsDisplayBlocks bool
+	MaxContextWindow      int
+	SupportedModels       []string
 }
 
 // AdapterError is a typed error that lets the UI distinguish failure modes.
@@ -127,13 +146,15 @@ type ErrorCode int
 
 const (
 	ErrUnknown       ErrorCode = iota
-	ErrCrashed                 // adapter process died
-	ErrRateLimited             // upstream rate limit
-	ErrContextLength           // conversation too long
-	ErrAuth                    // authentication failure
-	ErrTimeout                 // operation timed out
-	ErrCancelled               // cancelled by user
-	ErrPermission              // tool permission denied
+	ErrCrashed
+	ErrRateLimited
+	ErrContextLength
+	ErrAuth
+	ErrTimeout
+	ErrCancelled
+	ErrPermission
+	ErrToolNotFound
+	ErrToolExecution
 )
 
 // Adapter is the core interface for AI CLI adapters.
@@ -152,6 +173,22 @@ type Adapter interface {
 // to expose their session ID for resume support.
 type SessionProvider interface {
 	SessionID() string
+}
+
+// SessionManager is an optional interface for full session lifecycle management.
+type SessionManager interface {
+	SessionProvider
+	ListSessions(ctx context.Context) ([]SessionInfo, error)
+	ResumeSession(ctx context.Context, sessionID string) error
+	DeleteSession(ctx context.Context, sessionID string) error
+}
+
+// SessionInfo describes a persisted session.
+type SessionInfo struct {
+	ID        string
+	WorkDir   string
+	UpdatedAt int64  // Timestamp in milliseconds
+	Brief     string // First user message preview
 }
 
 // HistoryClearer is an optional interface that adapters can implement
@@ -175,11 +212,33 @@ type ConversationManager interface {
 // PermissionResponder is an optional interface for adapters that surface
 // permission requests and accept user decisions.
 type PermissionResponder interface {
-	RespondPermission(ctx context.Context, toolCallID string, approved bool) error
+	RespondPermission(ctx context.Context, toolCallID string, response ApprovalResponse) error
 }
 
 // StatusListener is an optional interface for adapters that notify on
 // lifecycle changes without polling.
 type StatusListener interface {
 	OnStatusChange(fn func(AdapterStatus))
+}
+
+// Checkpoint represents a saved state that can be restored.
+type Checkpoint struct {
+	ID        string
+	CreatedAt time.Time
+	Summary   string
+}
+
+// CheckpointManager is an optional interface for adapters that support
+// checkpoint/restore functionality.
+type CheckpointManager interface {
+	CreateCheckpoint(ctx context.Context) (string, error)
+	RestoreCheckpoint(ctx context.Context, checkpointID string) error
+	ListCheckpoints(ctx context.Context) ([]Checkpoint, error)
+}
+
+// ModelSwitcher is an optional interface for adapters that support
+// switching models mid-session.
+type ModelSwitcher interface {
+	SetModel(ctx context.Context, model string) error
+	GetModel() string
 }

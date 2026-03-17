@@ -74,9 +74,15 @@ type ClaudeAdapter struct {
 
 	// Permission handling.
 	permissionCh chan permissionDecision
-	
+
 	// Status change callbacks.
 	statusCallbacks []func(ai.AdapterStatus)
+
+	// Event relay: unbounded buffer between emit() and events channel.
+	// Prevents emit() from blocking when the consumer is slow, which would
+	// otherwise stall the entire message processing pipeline.
+	internalEvents chan ai.StreamEvent
+	relayWg        sync.WaitGroup
 }
 
 func NewClaudeAdapter() *ClaudeAdapter {
@@ -95,6 +101,9 @@ func (c *ClaudeAdapter) Start(ctx context.Context, cfg ai.AdapterConfig) error {
 	c.config = cfg
 	c.events = make(chan ai.StreamEvent, 64)
 	c.done = make(chan struct{})
+	c.internalEvents = make(chan ai.StreamEvent, 128)
+	c.relayWg.Add(1)
+	go c.eventRelay()
 
 	// Build SDK client options — default to safe permission mode.
 	permMode := claudecode.PermissionModeDefault
@@ -198,14 +207,68 @@ func (c *ClaudeAdapter) setStatus(status ai.AdapterStatus) {
 	}
 }
 
-// emit safely sends an event to the events channel, returning false if the
-// adapter has been stopped.
+// emit safely enqueues an event for delivery to the consumer. Events are
+// buffered through an intermediary relay goroutine with an unbounded queue,
+// so this method never blocks even if the consumer is slow to drain events.
 func (c *ClaudeAdapter) emit(event ai.StreamEvent) bool {
 	select {
 	case <-c.done:
 		return false
-	case c.events <- event:
+	case c.internalEvents <- event:
 		return true
+	}
+}
+
+// eventRelay is an intermediary goroutine that provides an unbounded buffer
+// between emit() and the events channel. Without this, a slow consumer causes
+// emit() to block, which stalls runClaude(), which stalls the transport's
+// stdout reader, which causes the CLI subprocess to block on writes — a full
+// pipeline deadlock that manifests as "messages stop appearing".
+func (c *ClaudeAdapter) eventRelay() {
+	defer c.relayWg.Done()
+	defer close(c.events)
+
+	var buf []ai.StreamEvent
+
+	for {
+		if len(buf) == 0 {
+			// Nothing buffered — block until a new event arrives or the
+			// channel is closed.
+			ev, ok := <-c.internalEvents
+			if !ok {
+				return
+			}
+			buf = append(buf, ev)
+		} else {
+			// Events buffered — try to forward the head to the consumer
+			// while also accepting new events from producers.
+			select {
+			case ev, ok := <-c.internalEvents:
+				if !ok {
+					// Producers are done. Flush remaining events with a
+					// deadline so Stop() doesn't hang if the consumer is gone.
+					deadline := time.After(time.Second)
+					for _, e := range buf {
+						select {
+						case c.events <- e:
+						case <-deadline:
+							return
+						}
+					}
+					return
+				}
+				buf = append(buf, ev)
+			case c.events <- buf[0]:
+				buf[0] = ai.StreamEvent{} // zero for GC
+				buf = buf[1:]
+				// Reclaim memory when the backing array is oversized.
+				if cap(buf) > 256 && len(buf) < cap(buf)/4 {
+					shrunk := make([]ai.StreamEvent, len(buf))
+					copy(shrunk, buf)
+					buf = shrunk
+				}
+			}
+		}
 	}
 }
 
@@ -769,12 +832,23 @@ func (c *ClaudeAdapter) Stop() error {
 	if c.client != nil {
 		c.client.Disconnect()
 	}
+	hasRelay := c.internalEvents != nil
 	c.setStatus(ai.StatusStopped)
 	c.mu.Unlock()
 
-	// Wait for all goroutines to finish before closing the events channel.
+	// Wait for all producer goroutines (runLoop, forwardClientErrors) to
+	// finish. After this, no more emit() calls will occur.
 	c.wg.Wait()
-	close(c.events)
+
+	if hasRelay {
+		// Close the internal channel to signal the relay to flush remaining
+		// events and close the consumer-facing events channel.
+		close(c.internalEvents)
+		c.relayWg.Wait()
+	} else {
+		// No relay (e.g. test setup that bypasses Start) — close directly.
+		close(c.events)
+	}
 	return nil
 }
 

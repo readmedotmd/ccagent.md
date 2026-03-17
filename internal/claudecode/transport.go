@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	channelBufferSize      = 10
+	channelBufferSize      = 128
 	terminationTimeoutSecs = 5
 	maxScanTokenSize       = 1024 * 1024 // 1MB
 )

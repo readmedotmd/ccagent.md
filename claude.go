@@ -1,3 +1,39 @@
+// Package claude provides a Go adapter for the Claude Code CLI.
+//
+// It implements the ai.Adapter interface by spawning the Claude Code CLI as a
+// subprocess and communicating via newline-delimited JSON over stdin/stdout.
+// The adapter supports streaming responses, conversation history with automatic
+// context compaction, sub-agent delegation, multimodal inputs, and MCP servers.
+//
+// # Architecture
+//
+// The message pipeline flows through several stages:
+//
+//	CLI subprocess (stdout) → transport → parser → client → runClaude → emit → eventRelay → events channel → consumer
+//
+// An unbounded event relay sits between emit() and the consumer-facing events
+// channel to prevent backpressure from stalling the entire pipeline. Without
+// this, a slow consumer would block emit(), which blocks the stdout reader,
+// which causes the CLI subprocess to block on writes.
+//
+// # Usage
+//
+//	adapter := claude.NewClaudeAdapter()
+//	err := adapter.Start(ctx, ai.AdapterConfig{
+//	    WorkDir:        "/path/to/project",
+//	    PermissionMode: ai.PermissionAcceptAll,
+//	})
+//	defer adapter.Stop()
+//
+//	adapter.Send(ctx, ai.Message{Content: ai.TextContent("Hello")})
+//	for ev := range adapter.Receive() {
+//	    switch ev.Type {
+//	    case ai.EventToken:
+//	        fmt.Print(ev.Token)
+//	    case ai.EventDone:
+//	        return
+//	    }
+//	}
 package claude
 
 import (
@@ -50,6 +86,18 @@ type permissionDecision struct {
 	response   ai.ApprovalResponse
 }
 
+// ClaudeAdapter implements ai.Adapter by communicating with the Claude Code
+// CLI as a subprocess. It also implements the optional ai.SessionProvider,
+// ai.HistoryProvider, ai.HistoryClearer, and ai.PermissionResponder interfaces.
+//
+// Messages are queued when the adapter is busy processing a previous turn.
+// Queued messages are automatically combined into a single turn when the
+// current turn completes. The queue has a hard limit of 100 messages.
+//
+// The adapter tracks conversation history internally for automatic context
+// compaction. When estimated token usage exceeds 80% of the context window,
+// the conversation is summarized and a new session is started with the summary
+// as context.
 type ClaudeAdapter struct {
 	mu     sync.Mutex
 	wg     sync.WaitGroup
@@ -85,6 +133,8 @@ type ClaudeAdapter struct {
 	relayWg        sync.WaitGroup
 }
 
+// NewClaudeAdapter creates a new adapter in the idle state. Call Start() to
+// connect to the Claude Code CLI and begin accepting messages.
 func NewClaudeAdapter() *ClaudeAdapter {
 	return &ClaudeAdapter{
 		status:       ai.StatusIdle,
@@ -210,7 +260,16 @@ func (c *ClaudeAdapter) setStatus(status ai.AdapterStatus) {
 // emit safely enqueues an event for delivery to the consumer. Events are
 // buffered through an intermediary relay goroutine with an unbounded queue,
 // so this method never blocks even if the consumer is slow to drain events.
+// Safe to call after Stop() — returns false without panicking.
 func (c *ClaudeAdapter) emit(event ai.StreamEvent) bool {
+	// Prioritize shutdown: if done is already closed, return immediately
+	// without attempting to send. This avoids the non-determinism of Go's
+	// select when both cases are ready.
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
 	select {
 	case <-c.done:
 		return false
@@ -224,6 +283,10 @@ func (c *ClaudeAdapter) emit(event ai.StreamEvent) bool {
 // emit() to block, which stalls runClaude(), which stalls the transport's
 // stdout reader, which causes the CLI subprocess to block on writes — a full
 // pipeline deadlock that manifests as "messages stop appearing".
+//
+// The relay watches the done channel for shutdown rather than relying on
+// internalEvents being closed. This means internalEvents is never closed,
+// so emit() cannot panic even if called after Stop().
 func (c *ClaudeAdapter) eventRelay() {
 	defer c.relayWg.Done()
 	defer close(c.events)
@@ -232,31 +295,20 @@ func (c *ClaudeAdapter) eventRelay() {
 
 	for {
 		if len(buf) == 0 {
-			// Nothing buffered — block until a new event arrives or the
-			// channel is closed.
-			ev, ok := <-c.internalEvents
-			if !ok {
+			// Nothing buffered — block until a new event arrives or
+			// shutdown is signalled.
+			select {
+			case ev := <-c.internalEvents:
+				buf = append(buf, ev)
+			case <-c.done:
+				c.drainInternalEvents()
 				return
 			}
-			buf = append(buf, ev)
 		} else {
 			// Events buffered — try to forward the head to the consumer
 			// while also accepting new events from producers.
 			select {
-			case ev, ok := <-c.internalEvents:
-				if !ok {
-					// Producers are done. Flush remaining events with a
-					// deadline so Stop() doesn't hang if the consumer is gone.
-					deadline := time.After(time.Second)
-					for _, e := range buf {
-						select {
-						case c.events <- e:
-						case <-deadline:
-							return
-						}
-					}
-					return
-				}
+			case ev := <-c.internalEvents:
 				buf = append(buf, ev)
 			case c.events <- buf[0]:
 				buf[0] = ai.StreamEvent{} // zero for GC
@@ -267,7 +319,37 @@ func (c *ClaudeAdapter) eventRelay() {
 					copy(shrunk, buf)
 					buf = shrunk
 				}
+			case <-c.done:
+				// Shutdown: flush buffered events with a deadline so
+				// Stop() doesn't hang if the consumer is gone.
+				deadline := time.After(time.Second)
+				for _, e := range buf {
+					select {
+					case c.events <- e:
+					case <-deadline:
+						return
+					}
+				}
+				c.drainInternalEvents()
+				return
 			}
+		}
+	}
+}
+
+// drainInternalEvents non-blockingly reads any remaining events from
+// internalEvents and attempts to forward them to the consumer.
+func (c *ClaudeAdapter) drainInternalEvents() {
+	for {
+		select {
+		case ev := <-c.internalEvents:
+			select {
+			case c.events <- ev:
+			default:
+				return
+			}
+		default:
+			return
 		}
 	}
 }
@@ -574,8 +656,9 @@ func (c *ClaudeAdapter) runClaude(ctx context.Context, msg ai.Message) {
 			c.mu.Lock()
 			c.history = append(c.history, trackedMessage{role: "assistant", content: content})
 			c.estimatedTokens += estimateTokens(content)
+			estTokens := c.estimatedTokens
 			c.mu.Unlock()
-			log.Printf("claude: ResultMessage done, content_len=%d est_tokens=%d", len(content), c.estimatedTokens)
+			log.Printf("claude: ResultMessage done, content_len=%d est_tokens=%d", len(content), estTokens)
 
 			// Emit cost update if available.
 			if m.TotalCostUSD != nil {
@@ -671,6 +754,11 @@ func (c *ClaudeAdapter) compactSession(ctx context.Context) {
 
 	if err := client.Query(ctx, summarizePrompt); err != nil {
 		log.Printf("claude: compaction summary query failed, skipping compaction")
+		// Back off the estimate so the next message doesn't immediately
+		// re-trigger compaction, which would create a tight retry loop.
+		c.mu.Lock()
+		c.estimatedTokens = int(float64(c.contextWindow) * 0.70)
+		c.mu.Unlock()
 		c.emit(ai.StreamEvent{
 			Type:      ai.EventCompactionEnd,
 			Timestamp: time.Now(),
@@ -837,13 +925,15 @@ func (c *ClaudeAdapter) Stop() error {
 	c.mu.Unlock()
 
 	// Wait for all producer goroutines (runLoop, forwardClientErrors) to
-	// finish. After this, no more emit() calls will occur.
+	// finish. After this, no more emit() calls will occur in practice.
 	c.wg.Wait()
 
 	if hasRelay {
-		// Close the internal channel to signal the relay to flush remaining
-		// events and close the consumer-facing events channel.
-		close(c.internalEvents)
+		// The relay watches done and will flush remaining events then
+		// close the consumer-facing events channel. We intentionally do
+		// NOT close internalEvents so that any straggling emit() calls
+		// (e.g. from a race during shutdown) write harmlessly into the
+		// buffer instead of panicking on a closed channel.
 		c.relayWg.Wait()
 	} else {
 		// No relay (e.g. test setup that bypasses Start) — close directly.

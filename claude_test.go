@@ -628,3 +628,370 @@ func TestDefaultContextWindowConstant(t *testing.T) {
 		t.Fatalf("expected 200000, got %d", DefaultContextWindow)
 	}
 }
+
+// --- Event relay ---
+
+// newTestAdapterWithRelay creates an adapter with the event relay running,
+// similar to what Start() does but without needing a real CLI connection.
+func newTestAdapterWithRelay() *ClaudeAdapter {
+	a := NewClaudeAdapter()
+	a.mu.Lock()
+	a.status = ai.StatusRunning
+	a.events = make(chan ai.StreamEvent, 64)
+	a.done = make(chan struct{})
+	a.internalEvents = make(chan ai.StreamEvent, 128)
+	a.relayWg.Add(1)
+	go a.eventRelay()
+	a.mu.Unlock()
+	return a
+}
+
+func TestEventRelayForwardsEvents(t *testing.T) {
+	a := newTestAdapterWithRelay()
+	defer a.Stop()
+
+	ch := a.Receive()
+
+	a.emit(ai.StreamEvent{Type: ai.EventToken, Token: "hello"})
+	a.emit(ai.StreamEvent{Type: ai.EventToken, Token: " world"})
+
+	ev1 := <-ch
+	if ev1.Token != "hello" {
+		t.Fatalf("expected 'hello', got %q", ev1.Token)
+	}
+	ev2 := <-ch
+	if ev2.Token != " world" {
+		t.Fatalf("expected ' world', got %q", ev2.Token)
+	}
+}
+
+func TestEventRelayUnboundedBuffer(t *testing.T) {
+	a := newTestAdapterWithRelay()
+
+	// Fill beyond the events channel buffer (64) without reading.
+	// With the relay, emit() should never block because the relay
+	// accumulates in its unbounded slice.
+	const n = 300
+	for i := 0; i < n; i++ {
+		if !a.emit(ai.StreamEvent{Type: ai.EventToken, Token: "x"}) {
+			t.Fatalf("emit returned false at i=%d", i)
+		}
+	}
+
+	// Now drain and count.
+	ch := a.Receive()
+	count := 0
+	done := make(chan struct{})
+	go func() {
+		for range ch {
+			count++
+			if count == n {
+				close(done)
+				return
+			}
+		}
+	}()
+
+	// Wait for all events to be received or timeout.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for events, got %d/%d", count, n)
+	}
+
+	a.Stop()
+}
+
+func TestEventRelayFlushesOnStop(t *testing.T) {
+	a := newTestAdapterWithRelay()
+	ch := a.Receive()
+
+	// Emit some events.
+	a.emit(ai.StreamEvent{Type: ai.EventToken, Token: "a"})
+	a.emit(ai.StreamEvent{Type: ai.EventToken, Token: "b"})
+	a.emit(ai.StreamEvent{Type: ai.EventDone})
+
+	a.Stop()
+
+	// After stop, channel should be closed. Drain remaining events.
+	var tokens []string
+	for ev := range ch {
+		if ev.Type == ai.EventToken {
+			tokens = append(tokens, ev.Token)
+		}
+	}
+	if len(tokens) < 2 {
+		t.Fatalf("expected at least 2 token events flushed, got %d", len(tokens))
+	}
+}
+
+func TestEventRelayClosesChannelOnStop(t *testing.T) {
+	a := newTestAdapterWithRelay()
+	ch := a.Receive()
+	a.Stop()
+
+	// Channel should be closed after Stop.
+	_, ok := <-ch
+	if ok {
+		t.Fatal("expected events channel to be closed after Stop with relay")
+	}
+}
+
+func TestEmitReturnsFalseAfterDone(t *testing.T) {
+	a := newTestAdapterWithRelay()
+	a.Stop()
+
+	// After stop, done is closed. emit should return false.
+	if a.emit(ai.StreamEvent{Type: ai.EventToken, Token: "late"}) {
+		t.Fatal("expected emit to return false after Stop")
+	}
+}
+
+func TestEventRelayMemoryReclaim(t *testing.T) {
+	a := newTestAdapterWithRelay()
+	defer a.Stop()
+
+	// Fill up a large buffer by emitting many events without reading.
+	const n = 512
+	for i := 0; i < n; i++ {
+		a.emit(ai.StreamEvent{Type: ai.EventToken, Token: "x"})
+	}
+
+	// Now drain all events — the relay should reclaim memory internally.
+	ch := a.Receive()
+	for i := 0; i < n; i++ {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out at event %d", i)
+		}
+	}
+
+	// Emit a few more events to verify the relay still works after shrinking.
+	for i := 0; i < 5; i++ {
+		if !a.emit(ai.StreamEvent{Type: ai.EventToken, Token: "y"}) {
+			t.Fatalf("emit failed after drain at i=%d", i)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		select {
+		case ev := <-ch:
+			if ev.Token != "y" {
+				t.Fatalf("expected 'y', got %q", ev.Token)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out at post-drain event %d", i)
+		}
+	}
+}
+
+// --- GetHistory / ClearHistory ---
+
+func TestGetHistoryEmpty(t *testing.T) {
+	a := NewClaudeAdapter()
+	msgs, err := a.GetHistory(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("expected empty history, got %d", len(msgs))
+	}
+}
+
+func TestGetHistoryReturnsTrackedMessages(t *testing.T) {
+	a := NewClaudeAdapter()
+	a.mu.Lock()
+	a.history = []trackedMessage{
+		{role: "user", content: "hello"},
+		{role: "assistant", content: "hi there"},
+		{role: "user", content: "how are you?"},
+	}
+	a.mu.Unlock()
+
+	msgs, err := a.GetHistory(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgs))
+	}
+	if msgs[0].Role != ai.RoleUser {
+		t.Fatalf("expected user role, got %s", msgs[0].Role)
+	}
+	if msgs[1].Role != ai.RoleAssistant {
+		t.Fatalf("expected assistant role, got %s", msgs[1].Role)
+	}
+	// Verify text content round-trips.
+	text := ""
+	for _, b := range msgs[0].Content {
+		text += b.Text
+	}
+	if text != "hello" {
+		t.Fatalf("expected 'hello', got %q", text)
+	}
+}
+
+func TestClearHistory(t *testing.T) {
+	a := NewClaudeAdapter()
+	a.mu.Lock()
+	a.history = []trackedMessage{
+		{role: "user", content: "hello"},
+		{role: "assistant", content: "hi"},
+	}
+	a.estimatedTokens = 500
+	a.mu.Unlock()
+
+	if err := a.ClearHistory(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	a.mu.Lock()
+	histLen := len(a.history)
+	tokens := a.estimatedTokens
+	a.mu.Unlock()
+
+	if histLen != 0 {
+		t.Fatalf("expected empty history, got %d", histLen)
+	}
+	if tokens != 0 {
+		t.Fatalf("expected 0 estimated tokens, got %d", tokens)
+	}
+}
+
+// --- OnStatusChange ---
+
+func TestOnStatusChange(t *testing.T) {
+	a := NewClaudeAdapter()
+
+	var received []ai.AdapterStatus
+	a.OnStatusChange(func(s ai.AdapterStatus) {
+		received = append(received, s)
+	})
+
+	// Simulate status changes.
+	a.mu.Lock()
+	a.setStatus(ai.StatusRunning)
+	a.setStatus(ai.StatusStopped)
+	a.mu.Unlock()
+
+	if len(received) != 2 {
+		t.Fatalf("expected 2 status changes, got %d", len(received))
+	}
+	if received[0] != ai.StatusRunning {
+		t.Fatalf("expected StatusRunning, got %d", received[0])
+	}
+	if received[1] != ai.StatusStopped {
+		t.Fatalf("expected StatusStopped, got %d", received[1])
+	}
+}
+
+func TestOnStatusChangeMultipleListeners(t *testing.T) {
+	a := NewClaudeAdapter()
+
+	count1 := 0
+	count2 := 0
+	a.OnStatusChange(func(s ai.AdapterStatus) { count1++ })
+	a.OnStatusChange(func(s ai.AdapterStatus) { count2++ })
+
+	a.mu.Lock()
+	a.setStatus(ai.StatusRunning)
+	a.mu.Unlock()
+
+	if count1 != 1 || count2 != 1 {
+		t.Fatalf("expected both listeners called, got %d and %d", count1, count2)
+	}
+}
+
+// --- RespondPermission ---
+
+func TestRespondPermission(t *testing.T) {
+	a := NewClaudeAdapter()
+
+	err := a.RespondPermission(context.Background(), "call-1", ai.ApprovalResponseApprove)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the decision was enqueued.
+	select {
+	case d := <-a.permissionCh:
+		if d.toolCallID != "call-1" || d.response != ai.ApprovalResponseApprove {
+			t.Fatal("unexpected permission decision")
+		}
+	default:
+		t.Fatal("expected decision in channel")
+	}
+}
+
+func TestRespondPermissionCancelled(t *testing.T) {
+	a := NewClaudeAdapter()
+
+	// Fill the permission channel to force blocking.
+	for i := 0; i < 16; i++ {
+		_ = a.RespondPermission(context.Background(), "fill", ai.ApprovalResponseReject)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := a.RespondPermission(ctx, "call-2", ai.ApprovalResponseApprove)
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+}
+
+// --- Concurrent emit safety ---
+
+func TestEmitConcurrentSafety(t *testing.T) {
+	a := newTestAdapterWithRelay()
+	defer a.Stop()
+	ch := a.Receive()
+
+	const goroutines = 10
+	const perGoroutine = 100
+	done := make(chan struct{})
+
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			for i := 0; i < perGoroutine; i++ {
+				a.emit(ai.StreamEvent{Type: ai.EventToken, Token: "x"})
+			}
+		}()
+	}
+
+	// Drain all events.
+	go func() {
+		count := 0
+		for range ch {
+			count++
+			if count == goroutines*perGoroutine {
+				close(done)
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for concurrent events")
+	}
+}
+
+// --- estimateTokens edge cases ---
+
+func TestEstimateTokensUnicode(t *testing.T) {
+	// Unicode characters should be counted as runes, not bytes.
+	got := estimateTokens("こんにちは") // 5 runes
+	if got != 1 {
+		t.Fatalf("expected 1 (5 runes / 4), got %d", got)
+	}
+}
+
+func TestEstimateTokensLong(t *testing.T) {
+	text := string(make([]byte, 4000)) // 4000 ASCII characters = 4000 runes
+	got := estimateTokens(text)
+	if got != 1000 {
+		t.Fatalf("expected 1000, got %d", got)
+	}
+}

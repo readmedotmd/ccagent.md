@@ -1,3 +1,17 @@
+// Package ai_adapters defines the interfaces and types for AI CLI adapters.
+//
+// The core [Adapter] interface provides a uniform way to interact with AI
+// assistants through streaming events. Adapters handle the lifecycle of a
+// connection (Start/Stop), message sending (Send), response streaming
+// (Receive), and graceful cancellation (Cancel).
+//
+// Optional interfaces extend adapter capabilities: [SessionProvider] for
+// session resume support, [HistoryProvider] for conversation retrieval,
+// [PermissionResponder] for interactive tool approval, and others.
+//
+// Stream events flow through a channel returned by [Adapter.Receive] and
+// cover the full lifecycle of a response: token streaming, tool use,
+// thinking, file changes, sub-agent activity, context compaction, and more.
 package ai_adapters
 
 import (

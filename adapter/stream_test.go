@@ -211,3 +211,212 @@ func TestStreamEventCostUpdate(t *testing.T) {
 		t.Fatal("unexpected total cost")
 	}
 }
+
+// --- Extended event type tests ---
+
+func TestStreamEventTypesExtended(t *testing.T) {
+	// Verify the full set of event types have expected iota values.
+	types := map[StreamEventType]int{
+		EventCompactionBegin: 13,
+		EventCompactionEnd:   14,
+		EventStepBegin:       15,
+		EventStepEnd:         16,
+		EventToolInputStream: 17,
+		EventExternalToolCall: 18,
+		EventDisplayBlock:    19,
+	}
+	for et, want := range types {
+		if int(et) != want {
+			t.Errorf("event type %d: expected iota %d", et, want)
+		}
+	}
+}
+
+func TestStreamEventCompaction(t *testing.T) {
+	ev := StreamEvent{
+		Type: EventCompactionBegin,
+		Compaction: &CompactionInfo{
+			Reason:       "context_limit",
+			TokensBefore: 180000,
+			TokensAfter:  0,
+			Summary:      "",
+		},
+		Timestamp: time.Now(),
+	}
+	if ev.Compaction.Reason != "context_limit" {
+		t.Fatal("unexpected compaction reason")
+	}
+	if ev.Compaction.TokensBefore != 180000 {
+		t.Fatal("unexpected tokens before")
+	}
+
+	ev2 := StreamEvent{
+		Type: EventCompactionEnd,
+		Compaction: &CompactionInfo{
+			Reason:       "context_limit",
+			TokensBefore: 180000,
+			TokensAfter:  5000,
+			Summary:      "User asked to refactor auth module. Changes made to auth.go and handler.go.",
+		},
+		Timestamp: time.Now(),
+	}
+	if ev2.Compaction.TokensAfter != 5000 {
+		t.Fatal("unexpected tokens after")
+	}
+	if ev2.Compaction.Summary == "" {
+		t.Fatal("expected non-empty summary")
+	}
+}
+
+func TestStreamEventStep(t *testing.T) {
+	begin := StreamEvent{
+		Type: EventStepBegin,
+		Step: &StepInfo{
+			StepNumber: 1,
+			TotalSteps: -1, // unknown total
+		},
+		Timestamp: time.Now(),
+	}
+	if begin.Step.StepNumber != 1 || begin.Step.TotalSteps != -1 {
+		t.Fatal("unexpected step begin fields")
+	}
+
+	end := StreamEvent{
+		Type: EventStepEnd,
+		Step: &StepInfo{
+			StepNumber: 1,
+			TotalSteps: 1,
+		},
+		Timestamp: time.Now(),
+	}
+	if end.Step.StepNumber != 1 || end.Step.TotalSteps != 1 {
+		t.Fatal("unexpected step end fields")
+	}
+}
+
+func TestStreamEventDisplayBlock(t *testing.T) {
+	tests := []struct {
+		name  string
+		block DisplayBlock
+	}{
+		{
+			name: "brief",
+			block: DisplayBlock{
+				Type: DisplayBlockBrief,
+				Text: "Working on auth module",
+			},
+		},
+		{
+			name: "diff",
+			block: DisplayBlock{
+				Type:    DisplayBlockDiff,
+				Path:    "auth.go",
+				OldText: "func login() {}",
+				NewText: "func login(ctx context.Context) error {}",
+			},
+		},
+		{
+			name: "todo",
+			block: DisplayBlock{
+				Type: DisplayBlockTodo,
+				Items: []TodoItem{
+					{Title: "Fix auth", Status: TodoStatusDone},
+					{Title: "Add tests", Status: TodoStatusInProgress},
+					{Title: "Deploy", Status: TodoStatusPending},
+				},
+			},
+		},
+		{
+			name: "shell",
+			block: DisplayBlock{
+				Type:     DisplayBlockShell,
+				Command:  "go test ./...",
+				Language: "bash",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := StreamEvent{
+				Type:         EventDisplayBlock,
+				DisplayBlock: &tt.block,
+				Timestamp:    time.Now(),
+			}
+			if ev.DisplayBlock == nil {
+				t.Fatal("expected non-nil display block")
+			}
+		})
+	}
+}
+
+func TestDisplayBlockTypes(t *testing.T) {
+	types := map[DisplayBlockType]string{
+		DisplayBlockBrief:   "brief",
+		DisplayBlockDiff:    "diff",
+		DisplayBlockTodo:    "todo",
+		DisplayBlockShell:   "shell",
+		DisplayBlockUnknown: "unknown",
+	}
+	for dt, want := range types {
+		if string(dt) != want {
+			t.Errorf("expected %q, got %q", want, dt)
+		}
+	}
+}
+
+func TestTodoStatuses(t *testing.T) {
+	statuses := map[TodoStatus]string{
+		TodoStatusPending:    "pending",
+		TodoStatusInProgress: "in_progress",
+		TodoStatusDone:       "done",
+	}
+	for ts, want := range statuses {
+		if string(ts) != want {
+			t.Errorf("expected %q, got %q", want, ts)
+		}
+	}
+}
+
+func TestSubAgentStatuses(t *testing.T) {
+	statuses := map[SubAgentStatus]string{
+		SubAgentStarted:   "started",
+		SubAgentCompleted: "completed",
+		SubAgentFailed:    "failed",
+	}
+	for s, want := range statuses {
+		if string(s) != want {
+			t.Errorf("expected %q, got %q", want, s)
+		}
+	}
+}
+
+func TestToolStatusValues(t *testing.T) {
+	statuses := map[ToolStatusValue]string{
+		ToolRunning:  "running",
+		ToolComplete: "complete",
+		ToolFailed:   "failed",
+	}
+	for s, want := range statuses {
+		if string(s) != want {
+			t.Errorf("expected %q, got %q", want, s)
+		}
+	}
+}
+
+func TestStreamEventDisplayBlockWithData(t *testing.T) {
+	ev := StreamEvent{
+		Type: EventDisplayBlock,
+		DisplayBlock: &DisplayBlock{
+			Type: DisplayBlockUnknown,
+			Data: map[string]any{
+				"custom_key": "custom_value",
+				"count":      42.0,
+			},
+		},
+		Timestamp: time.Now(),
+	}
+	if ev.DisplayBlock.Data["custom_key"] != "custom_value" {
+		t.Fatal("unexpected custom data")
+	}
+}

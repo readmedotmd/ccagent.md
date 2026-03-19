@@ -155,6 +155,27 @@ func (c *ClaudeAdapter) Start(ctx context.Context, cfg ai.AdapterConfig) error {
 	c.relayWg.Add(1)
 	go c.eventRelay()
 
+	client, err := c.newConnectedClient(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	c.client = client
+
+	// Forward client-level transport errors to the events channel.
+	c.wg.Add(1)
+	go c.forwardClientErrors(client)
+
+	c.contextWindow = cfg.ContextWindow
+	if c.contextWindow <= 0 {
+		c.contextWindow = DefaultContextWindow
+	}
+
+	c.setStatus(ai.StatusRunning)
+	return nil
+}
+
+// newConnectedClient builds and connects a claudecode.Client from an AdapterConfig.
+func (c *ClaudeAdapter) newConnectedClient(ctx context.Context, cfg ai.AdapterConfig) (claudecode.Client, error) {
 	// Build SDK client options — default to safe permission mode.
 	permMode := claudecode.PermissionModeDefault
 	switch cfg.PermissionMode {
@@ -220,21 +241,54 @@ func (c *ClaudeAdapter) Start(ctx context.Context, cfg ai.AdapterConfig) error {
 
 	client := claudecode.NewClient(opts...)
 	if err := client.Connect(ctx); err != nil {
-		return fmt.Errorf("claude sdk connect: %w", err)
+		return nil, fmt.Errorf("claude sdk connect: %w", err)
 	}
-	c.client = client
+	return client, nil
+}
 
-	// Forward client-level transport errors to the events channel.
+// reconnectClient replaces the dead subprocess with a fresh one.
+// Called after the subprocess exits unexpectedly (e.g. killed by SIGINT during
+// cancellation) so the next Send() doesn't hit a broken pipe.
+func (c *ClaudeAdapter) reconnectClient() {
+	c.mu.Lock()
+	if c.status != ai.StatusRunning {
+		c.mu.Unlock()
+		return
+	}
+	oldClient := c.client
+	// Read config while holding the lock; Connect is called outside.
+	cfg := c.config
+	// Use the latest session ID so the new process resumes the same session.
+	if c.sessionID != "" {
+		cfg.SessionID = c.sessionID
+		cfg.ContinueSession = true
+	}
+	c.mu.Unlock()
+
+	// Disconnect the dead client (best-effort; it may already be gone).
+	if oldClient != nil {
+		_ = oldClient.Disconnect()
+	}
+
+	newClient, err := c.newConnectedClient(context.Background(), cfg)
+	if err != nil {
+		log.Printf("claude: reconnect failed: %v", err)
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Only swap if nothing else already replaced the client (e.g. Stop()).
+	if c.status != ai.StatusRunning || c.client != oldClient {
+		_ = newClient.Disconnect()
+		return
+	}
+	c.client = newClient
+	log.Printf("claude: reconnected after subprocess exit")
+
+	// Start a new error-forwarding goroutine for the replacement client.
 	c.wg.Add(1)
-	go c.forwardClientErrors(client)
-
-	c.contextWindow = cfg.ContextWindow
-	if c.contextWindow <= 0 {
-		c.contextWindow = DefaultContextWindow
-	}
-
-	c.setStatus(ai.StatusRunning)
-	return nil
+	go c.forwardClientErrors(newClient)
 }
 
 // forwardClientErrors drains the client error channel and emits error events.
@@ -704,7 +758,13 @@ func (c *ClaudeAdapter) runClaude(ctx context.Context, msg ai.Message) {
 	// Fallback: if ReceiveMessages closed without a ResultMessage, emit done.
 	content := fullContent.String()
 	log.Printf("claude: ReceiveMessages ended without ResultMessage, content_len=%d", len(content))
-	
+
+	// The subprocess stdout closed without sending a ResultMessage. This
+	// happens when the process was killed (e.g. SIGINT from Cancel). The
+	// transport is now dead — reconnect so the next Send() doesn't hit a
+	// broken pipe.
+	go c.reconnectClient()
+
 	// Emit step end event
 	c.emit(ai.StreamEvent{
 		Type:      ai.EventStepEnd,
@@ -714,7 +774,7 @@ func (c *ClaudeAdapter) runClaude(ctx context.Context, msg ai.Message) {
 			TotalSteps: 1,
 		},
 	})
-	
+
 	c.emit(ai.StreamEvent{
 		Type:      ai.EventDone,
 		Timestamp: time.Now(),

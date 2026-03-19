@@ -145,12 +145,11 @@ func buildCommand(cliPath string, options *Options, closeStdin bool) []string {
 		}
 	}
 
-	// Setting sources (always pass, even if empty)
-	sourcesValue := ""
+	// Only pass --setting-sources when explicitly set, so Claude uses its default
+	// behavior (which includes user settings from ~/.claude/).
 	if len(options.SettingSources) > 0 {
-		sourcesValue = strings.Join(options.SettingSources, ",")
+		cmd = append(cmd, "--setting-sources", strings.Join(options.SettingSources, ","))
 	}
-	cmd = append(cmd, "--setting-sources", sourcesValue)
 
 	// Extra args (includes --mcp-config when MCP servers are configured).
 	// Only explicitly allowed flags are forwarded to the CLI.

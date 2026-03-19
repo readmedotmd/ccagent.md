@@ -17,6 +17,7 @@ type Client interface {
 	QueryStream(ctx context.Context, messages <-chan StreamMessage) error
 	ReceiveMessages(ctx context.Context) <-chan Message
 	ReceiveErrors() <-chan error
+	Interrupt(ctx context.Context) error
 }
 
 // clientImpl implements the Client interface.
@@ -187,4 +188,18 @@ func (c *clientImpl) ReceiveErrors() <-chan error {
 	}
 
 	return errChan
+}
+
+// Interrupt sends an interrupt signal to the Claude Code CLI subprocess,
+// causing it to stop its current operation immediately.
+func (c *clientImpl) Interrupt(ctx context.Context) error {
+	c.mu.RLock()
+	connected := c.connected
+	tr := c.transport
+	c.mu.RUnlock()
+
+	if !connected || tr == nil {
+		return nil
+	}
+	return tr.interrupt(ctx)
 }

@@ -409,6 +409,14 @@ func (c *ClaudeAdapter) Cancel() error {
 		c.runCancel()
 	}
 
+	// Interrupt the subprocess so it stops immediately rather than waiting
+	// for the next stdout message. Without this, cancellation is only
+	// detected between messages — so a long-running tool call would keep
+	// blocking until it naturally produced output.
+	if c.client != nil {
+		_ = c.client.Interrupt(context.Background())
+	}
+
 	log.Printf("claude: cancelled in-progress run")
 	return nil
 }
